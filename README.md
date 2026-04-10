@@ -15,6 +15,9 @@
 
 - **Python 3.11 или новее** (рекомендуется 3.11–3.13)
 - Операционная система: Windows / Linux / macOS
+- VC++ Redistributable (2015–2022)
+  <https://aka.ms/vs/17/release/vc_redist.x64.exe/>
+  <https://aka.ms/vs/17/release/vc_redist.x86.exe/>
 - Достаточно оперативной памяти для загрузки вашей таблицы красок (обычно хватает 1–2 ГБ)
 
 ## 📦 Установка
