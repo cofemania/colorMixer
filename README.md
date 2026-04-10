@@ -20,19 +20,20 @@
 ## 📦 Установка
 
 1. **Клонируйте репозиторий**
-   ```
-   git clone https://github.com/cofemania/colorMixer.git
-   cd ColorMixer
-   ```
+
+ ```
+ git clone https://github.com/cofemania/colorMixer.git
+ cd ColorMixer
+ ```
    
-Установите зависимости
+2. **Установите зависимости**
 
 ```
 pip install pandas numpy colormath2 tqdm numba
 ```
 Для максимальной скорости можно также установить Cython и скомпилировать модуль (см. раздел «Оптимизация»).
 
-Запустите скрипт
+3. **Запустите скрипт**
 
 ```
 python ColorMixer.py
