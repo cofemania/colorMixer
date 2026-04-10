@@ -62,9 +62,9 @@ python ColorMixer.py
 
 Для ещё более высокой скорости (в 50–100 раз) можно скомпилировать Cython-модуль:
 
-Установите Cython:
+Установите Cython и зависимостей:
 ```
-pip install cython
+pip install cython setuptools
 ```
 
 Запустите компиляцию:
