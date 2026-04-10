@@ -78,12 +78,12 @@ python setup.py build_ext --inplace
 
 📁 Структура проекта
 
-ColorMixer/
-├── ColorMixer.py          # основной скрипт
-├── paints.csv              # ваш файл с красками (создаёте сами)
-├── deltae_cython.pyx       # опциональный Cython-модуль
-├── setup.py                # для компиляции Cython
-└── README.md
+- `ColorMixer/`
+  - `color_mixer.py` – основной скрипт
+  - `paints.csv` – ваш файл с красками
+  - `deltae_cython.pyx` – опциональный Cython-модуль
+  - `setup.py` – для компиляции Cython
+  - `README.md` – этот файл
 
 ❓ Часто задаваемые вопросы
 Q: Что делать, если скрипт не видит файл paints.csv?
