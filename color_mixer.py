@@ -9,8 +9,10 @@ import os
 from tqdm import tqdm
 import multiprocessing as mp
 from functools import partial
+import heapq
+import traceback
 
-# Попытка импортировать ускоренную Delta E
+# ---------- Импорты для ускорения ----------
 USE_NUMBA = False
 USE_CYTHON = False
 
@@ -18,7 +20,11 @@ try:
     from numba import jit
     USE_NUMBA = True
 except ImportError:
-    jit = lambda x: x
+    def jit(*args, **kwargs):
+        if args and callable(args[0]):
+            return args[0]
+        return lambda f: f
+    USE_NUMBA = False
 
 try:
     from deltae_cython import delta_e_cie2000 as cython_delta_e
@@ -26,9 +32,7 @@ try:
 except ImportError:
     cython_delta_e = None
 
-# ============================================================
-# Быстрая Delta E 2000 (Numba)
-# ============================================================
+# ---------- Delta E 2000 (Numba) ----------
 @jit(nopython=True)
 def delta_e_cie2000_fast(L1, a1, b1, L2, a2, b2):
     kL, kC, kH = 1.0, 1.0, 1.0
@@ -84,9 +88,7 @@ def delta_e_cie2000_dispatch(lab1, lab2):
         from colormath.color_diff import delta_e_cie2000 as orig
         return orig(lab1, lab2)
 
-# ------------------------------------------------------------
-# Загрузка и подготовка данных (без изменений)
-# ------------------------------------------------------------
+# ---------- Загрузка CSV ----------
 CSV_FILENAME = "paints.csv"
 EPSILON = 0.5
 
@@ -164,78 +166,157 @@ def mix_colors(lab_list, weights):
     b = sum(w * c.lab_b for w, c in zip(weights, lab_list))
     return LabColor(L, a, b)
 
-# ------------------------------------------------------------
-# Многопроцессорные функции для перебора
-# ------------------------------------------------------------
-def process_pair(args, target_lab, paints_df, weights_list):
+# ---------- Оптимизированные функции для multiprocessing ----------
+def precompute_paints_data(paints_df):
+    paints_data = []
+    for idx, row in paints_df.iterrows():
+        lab = hex_to_lab(row['hex'])
+        paints_data.append({
+            'idx': idx,
+            'L': lab.lab_l,
+            'a': lab.lab_a,
+            'b': lab.lab_b,
+            'brand': row['brand'],
+            'name': row['name'],
+            'article': row['article'],
+            'hex': row['hex']
+        })
+    return paints_data
+
+def process_pair(args, target_L, target_a, target_b, paints_data, weights_list):
     idx1, idx2 = args
-    paint1 = paints_df.loc[idx1]
-    paint2 = paints_df.loc[idx2]
-    lab1 = hex_to_lab(paint1['hex'])
-    lab2 = hex_to_lab(paint2['hex'])
+    p1 = paints_data[idx1]
+    p2 = paints_data[idx2]
+    lab1 = (p1['L'], p1['a'], p1['b'])
+    lab2 = (p2['L'], p2['a'], p2['b'])
     results = []
     for w1, w2 in weights_list:
-        mixed = mix_colors([lab1, lab2], [w1, w2])
-        delta = delta_e_cie2000_dispatch(target_lab, mixed)
+        L_mix = w1 * lab1[0] + w2 * lab2[0]
+        a_mix = w1 * lab1[1] + w2 * lab2[1]
+        b_mix = w1 * lab1[2] + w2 * lab2[2]
+        mixed_lab = LabColor(L_mix, a_mix, b_mix)
+        target_lab = LabColor(target_L, target_a, target_b)
+        delta = delta_e_cie2000_dispatch(target_lab, mixed_lab)
         results.append({
             'delta_e': delta,
-            'paints': [paint1, paint2],
+            'paints': [p1, p2],
             'weights': (w1, w2),
-            'mixed_lab': mixed
+            'mixed_lab': mixed_lab
         })
     return results
 
-def process_triplet(args, target_lab, paints_df, weights):
+def process_triplet(args, target_L, target_a, target_b, paints_data, weights):
     idx1, idx2, idx3 = args
-    paint1 = paints_df.loc[idx1]
-    paint2 = paints_df.loc[idx2]
-    paint3 = paints_df.loc[idx3]
-    lab1 = hex_to_lab(paint1['hex'])
-    lab2 = hex_to_lab(paint2['hex'])
-    lab3 = hex_to_lab(paint3['hex'])
-    mixed = mix_colors([lab1, lab2, lab3], weights)
-    delta = delta_e_cie2000_dispatch(target_lab, mixed)
+    p1 = paints_data[idx1]
+    p2 = paints_data[idx2]
+    p3 = paints_data[idx3]
+    lab1 = (p1['L'], p1['a'], p1['b'])
+    lab2 = (p2['L'], p2['a'], p2['b'])
+    lab3 = (p3['L'], p3['a'], p3['b'])
+    L_mix = weights[0]*lab1[0] + weights[1]*lab2[0] + weights[2]*lab3[0]
+    a_mix = weights[0]*lab1[1] + weights[1]*lab2[1] + weights[2]*lab3[1]
+    b_mix = weights[0]*lab1[2] + weights[1]*lab2[2] + weights[2]*lab3[2]
+    mixed_lab = LabColor(L_mix, a_mix, b_mix)
+    target_lab = LabColor(target_L, target_a, target_b)
+    delta = delta_e_cie2000_dispatch(target_lab, mixed_lab)
     return {
         'delta_e': delta,
-        'paints': [paint1, paint2, paint3],
+        'paints': [p1, p2, p3],
         'weights': weights,
-        'mixed_lab': mixed
+        'mixed_lab': mixed_lab
     }
 
 def find_best_mix_2(target_lab, paints_df):
+    target_L = target_lab.lab_l
+    target_a = target_lab.lab_a
+    target_b = target_lab.lab_b
+
     weights_list = generate_weights_for_2()
-    pairs = list(combinations(paints_df.index, 2))
-    if not pairs:
-        return []
-    num_cores = max(1, mp.cpu_count() - 1)
-    print(f"🖥️ Используем {num_cores} процессоров для перебора 2 красок")
-    worker = partial(process_pair, target_lab=target_lab, paints_df=paints_df, weights_list=weights_list)
-    all_results = []
-    with mp.Pool(processes=num_cores) as pool:
-        # Используем imap_unordered с прогресс-баром
-        for chunk in tqdm(pool.imap_unordered(worker, pairs), total=len(pairs), desc="Перебор пар"):
-            all_results.extend(chunk)
-    all_results.sort(key=lambda x: x['delta_e'])
-    return all_results[:3]
+    paints_data = precompute_paints_data(paints_df)
+    n = len(paints_data)
+    total_pairs = n * (n - 1) // 2   # число сочетаний для tqdm
+
+    print(f"🖥️ Перебор 2 красок (однопоточный, всего {total_pairs} пар)")
+    top_results = []   # храним топ-3 (delta_e, результат)
+
+    from itertools import combinations
+    for idx1, idx2 in tqdm(combinations(range(n), 2), total=total_pairs, desc="Перебор пар"):
+        p1 = paints_data[idx1]
+        p2 = paints_data[idx2]
+        L1, a1, b1 = p1['L'], p1['a'], p1['b']
+        L2, a2, b2 = p2['L'], p2['a'], p2['b']
+
+        for w1, w2 in weights_list:
+            L_mix = w1 * L1 + w2 * L2
+            a_mix = w1 * a1 + w2 * a2
+            b_mix = w1 * b1 + w2 * b2
+
+            delta = delta_e_cie2000_fast(target_L, target_a, target_b, L_mix, a_mix, b_mix)
+
+            res = {
+                'delta_e': delta,
+                'paints': [p1, p2],
+                'weights': (w1, w2),
+                'mixed_lab': None   # не используем, можно удалить
+            }
+
+            # Вставка в топ-3 (простая, без heapq)
+            if len(top_results) < 3:
+                top_results.append(res)
+                top_results.sort(key=lambda x: x['delta_e'])
+            else:
+                if delta < top_results[-1]['delta_e']:
+                    top_results[-1] = res
+                    top_results.sort(key=lambda x: x['delta_e'])
+
+    return top_results
 
 def find_best_mix_3(target_lab, paints_df):
-    weights = (1/3, 1/3, 1/3)
-    triplets = list(combinations(paints_df.index, 3))
-    if not triplets:
-        return []
-    num_cores = max(1, mp.cpu_count() - 1)
-    print(f"🖥️ Используем {num_cores} процессоров для перебора 3 красок")
-    worker = partial(process_triplet, target_lab=target_lab, paints_df=paints_df, weights=weights)
-    all_results = []
-    with mp.Pool(processes=num_cores) as pool:
-        for res in tqdm(pool.imap_unordered(worker, triplets), total=len(triplets), desc="Перебор троек"):
-            all_results.append(res)
-    all_results.sort(key=lambda x: x['delta_e'])
-    return all_results[:3]
+    target_L = target_lab.lab_l
+    target_a = target_lab.lab_a
+    target_b = target_lab.lab_b
 
-# ------------------------------------------------------------
-# Остальные функции (точное совпадение, вывод и т.д.)
-# ------------------------------------------------------------
+    weights = (1/3, 1/3, 1/3)
+    paints_data = precompute_paints_data(paints_df)
+    n = len(paints_data)
+    total_triplets = n * (n - 1) * (n - 2) // 6
+
+    print(f"🖥️ Перебор 3 красок (однопоточный, всего {total_triplets} троек)")
+    top_results = []
+
+    from itertools import combinations
+    for idx1, idx2, idx3 in tqdm(combinations(range(n), 3), total=total_triplets, desc="Перебор троек"):
+        p1 = paints_data[idx1]
+        p2 = paints_data[idx2]
+        p3 = paints_data[idx3]
+        L1, a1, b1 = p1['L'], p1['a'], p1['b']
+        L2, a2, b2 = p2['L'], p2['a'], p2['b']
+        L3, a3, b3 = p3['L'], p3['a'], p3['b']
+
+        L_mix = weights[0]*L1 + weights[1]*L2 + weights[2]*L3
+        a_mix = weights[0]*a1 + weights[1]*a2 + weights[2]*a3
+        b_mix = weights[0]*b1 + weights[1]*b2 + weights[2]*b3
+
+        delta = delta_e_cie2000_fast(target_L, target_a, target_b, L_mix, a_mix, b_mix)
+
+        res = {
+            'delta_e': delta,
+            'paints': [p1, p2, p3],
+            'weights': weights,
+            'mixed_lab': None
+        }
+
+        if len(top_results) < 3:
+            top_results.append(res)
+            top_results.sort(key=lambda x: x['delta_e'])
+        else:
+            if delta < top_results[-1]['delta_e']:
+                top_results[-1] = res
+                top_results.sort(key=lambda x: x['delta_e'])
+
+    return top_results
+
+# ---------- Остальные функции ----------
 def find_exact_matches(target_lab, paints_df):
     matches = []
     for idx, row in paints_df.iterrows():
@@ -339,9 +420,7 @@ def print_results(target_hex, result_dict, alt_dict):
             print(f"  {j+1}. {format_paint_with_alternatives(p, alt_dict)}")
     print("\n* 100% = Delta E=0 (идеал), 0% = Delta E≥10")
 
-# ------------------------------------------------------------
-# Основной диалог
-# ------------------------------------------------------------
+# ---------- Основная функция ----------
 def interactive():
     print("🎨 ПОДБОР СМЕСИ КРАСОК (многопроцессорный, с Numba/Cython)")
     print("="*70)
@@ -365,6 +444,10 @@ def interactive():
     print_results(target, result, alt_dict)
 
 if __name__ == '__main__':
-    # Необходимо для multiprocessing на Windows
     mp.freeze_support()
-    interactive()
+    try:
+        interactive()
+    except Exception as e:
+        print("Ошибка:", e, file=sys.stderr)
+        traceback.print_exc()
+        input("Нажмите Enter для выхода...")
