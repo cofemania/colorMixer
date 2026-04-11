@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import sqlite3
 from colormath.color_objects import sRGBColor, LabColor
 from colormath.color_conversions import convert_color
 from math import gcd
@@ -11,6 +12,19 @@ import multiprocessing as mp
 from functools import partial
 import heapq
 import traceback
+
+# ------------ Цветные блоки ----------
+def color_block(hex_code, size=2):
+    """Возвращает строку с цветным квадратиком размера size x size символов"""
+    hex_code = hex_code.lstrip('#')
+    if len(hex_code) != 6:
+        return "[?]"
+    r = int(hex_code[0:2], 16)
+    g = int(hex_code[2:4], 16)
+    b = int(hex_code[4:6], 16)
+    # ANSI escape-код для фона
+    block = f"\x1b[48;2;{r};{g};{b}m{' ' * (size*2)}\x1b[0m"
+    return block
 
 # ---------- Импорты для ускорения ----------
 USE_NUMBA = False
@@ -88,50 +102,71 @@ def delta_e_cie2000_dispatch(lab1, lab2):
         from colormath.color_diff import delta_e_cie2000 as orig
         return orig(lab1, lab2)
 
-# ---------- Загрузка CSV ----------
-CSV_FILENAME = "paints.csv"
+# ---------- Загрузка базы ----------
+DB_FILENAME = "paints.db"
 EPSILON = 0.5
 
-def detect_encoding(file_path):
-    encodings = ['utf-8-sig', 'utf-8', 'cp1251', 'windows-1251', 'koi8-r', 'latin1']
-    for enc in encodings:
-        try:
-            with open(file_path, 'r', encoding=enc) as f:
-                f.readline()
-            return enc
-        except UnicodeDecodeError:
-            continue
-    return 'latin1'
-
-def detect_delimiter(file_path, encoding):
-    with open(file_path, 'r', encoding=encoding) as f:
-        first = f.readline()
-        return ';' if ';' in first and ',' not in first else ','
 
 def load_paints():
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    file_path = os.path.join(script_dir, CSV_FILENAME)
-    if not os.path.exists(file_path):
-        print(f"❌ Файл {CSV_FILENAME} не найден в папке:\n   {script_dir}")
+    db_path = os.path.join(script_dir, DB_FILENAME)
+    if not os.path.exists(db_path):
+        print(f"[X] Файл базы данных {DB_FILENAME} не найден в папке:\n   {script_dir}")
+        print("Убедитесь, что вы сконвертировали CSV в SQLite с помощью convert_csv_to_sqlite.py")
         sys.exit(1)
-    encoding = detect_encoding(file_path)
-    delim = detect_delimiter(file_path, encoding)
-    df = pd.read_csv(file_path, delimiter=delim, encoding=encoding)
-    df.columns = df.columns.str.strip().str.lower()
-    required = ['article', 'name', 'hex', 'brand']
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        other = ';' if delim == ',' else ','
-        df = pd.read_csv(file_path, delimiter=other, encoding=encoding)
-        df.columns = df.columns.str.strip().str.lower()
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            print(f"❌ Ошибка: в CSV нет колонок {required}\n   Найдено: {list(df.columns)}")
-            sys.exit(1)
+    
+    conn = sqlite3.connect(db_path)
+    # Читаем все нужные колонки
+    df = pd.read_sql_query("SELECT article, name, hex, brand FROM paints", conn)
+    conn.close()
+    
+    # Небольшая пост-обработка, как и раньше
     df['hex'] = df['hex'].astype(str).str.replace('#', '').str.upper()
     df = df.dropna(subset=['hex'])
-    print(f"✅ Загружено красок: {len(df)}")
+    
+    print(f"[OK] Загружено красок из SQLite: {len(df)}")
     return df
+
+#def detect_encoding(file_path):
+#    encodings = ['utf-8-sig', 'utf-8', 'cp1251', 'windows-1251', 'koi8-r', 'latin1']
+#    for enc in encodings:
+#       try:
+#           with open(file_path, 'r', encoding=enc) as f:
+#                f.readline()
+#            return enc
+#        except UnicodeDecodeError:
+#            continue
+#    return 'latin1'
+
+#def detect_delimiter(file_path, encoding):
+#    with open(file_path, 'r', encoding=encoding) as f:
+#        first = f.readline()
+#        return ';' if ';' in first and ',' not in first else ','
+
+#def load_paints():
+#    script_dir = os.path.dirname(os.path.abspath(__file__))
+#    file_path = os.path.join(script_dir, CSV_FILENAME)
+#    if not os.path.exists(file_path):
+#        print(f"[X] Файл {CSV_FILENAME} не найден в папке:\n   {script_dir}")
+#        sys.exit(1)
+#    encoding = detect_encoding(file_path)
+#    delim = detect_delimiter(file_path, encoding)
+#    df = pd.read_csv(file_path, delimiter=delim, encoding=encoding)
+#    df.columns = df.columns.str.strip().str.lower()
+#    required = ['article', 'name', 'hex', 'brand']
+#    missing = [c for c in required if c not in df.columns]
+#    if missing:
+#        other = ';' if delim == ',' else ','
+#        df = pd.read_csv(file_path, delimiter=other, encoding=encoding)
+#        df.columns = df.columns.str.strip().str.lower()
+#        missing = [c for c in required if c not in df.columns]
+#        if missing:
+#            print(f"[X] Ошибка: в CSV нет колонок {required}\n   Найдено: {list(df.columns)}")
+#            sys.exit(1)
+#    df['hex'] = df['hex'].astype(str).str.replace('#', '').str.upper()
+#    df = df.dropna(subset=['hex'])
+#    print(f"[OK] Загружено красок: {len(df)}")
+#    return df
 
 def hex_to_lab(hex_color):
     hex_color = hex_color.lstrip('#')
@@ -236,7 +271,7 @@ def find_best_mix_2(target_lab, paints_df):
     n = len(paints_data)
     total_pairs = n * (n - 1) // 2   # число сочетаний для tqdm
 
-    print(f"🖥️ Перебор 2 красок (однопоточный, всего {total_pairs} пар)")
+    print(f"[CPU️] Перебор 2 красок (однопоточный, всего {total_pairs} пар)")
     top_results = []   # храним топ-3 (delta_e, результат)
 
     from itertools import combinations
@@ -281,7 +316,7 @@ def find_best_mix_3(target_lab, paints_df):
     n = len(paints_data)
     total_triplets = n * (n - 1) * (n - 2) // 6
 
-    print(f"🖥️ Перебор 3 красок (однопоточный, всего {total_triplets} троек)")
+    print(f"🖥[CPU] Перебор 3 красок (однопоточный, всего {total_triplets} троек)")
     top_results = []
 
     from itertools import combinations
@@ -332,9 +367,9 @@ def delta_to_percent(delta):
 def auto_find_mixes(target_lab, paints_df):
     exact = find_exact_matches(target_lab, paints_df)
     if exact:
-        print(f"\n✅ Найдено точных совпадений: {len(exact)}")
+        print(f"\n[OK] Найдено точных совпадений: {len(exact)}")
         return {'type': 'exact', 'result': exact}
-    print("\n🎨 Точной краски нет. Пробуем смешать 2 краски...")
+    print("\n Точной краски нет. Пробуем смешать 2 краски...")
     best_2 = find_best_mix_2(target_lab, paints_df)
     if best_2:
         best_delta_2 = best_2[0]['delta_e']
@@ -381,7 +416,8 @@ def format_alternatives(hex_code, alt_dict):
 
 def format_paint_with_alternatives(paint_row, alt_dict):
     hex_code = paint_row['hex']
-    base = f"{paint_row['brand']} / {paint_row['name']} (арт.{paint_row['article']}) — #{hex_code}"
+    block = color_block(hex_code, size=2)
+    base = f"{block} {paint_row['brand']} / {paint_row['name']} (арт.{paint_row['article']}) — #{hex_code}"
     return base + format_alternatives(hex_code, alt_dict)
 
 def print_results(target_hex, result_dict, alt_dict):
@@ -390,7 +426,7 @@ def print_results(target_hex, result_dict, alt_dict):
     print("="*70)
     if result_dict['type'] == 'exact':
         matches = result_dict['result']
-        print(f"\n✅ Точное совпадение (Delta E ≤ {EPSILON}):")
+        print(f"\n[OK] Точное совпадение (Delta E ≤ {EPSILON}):")
         for i, match in enumerate(matches):
             paint = match['paint']
             line = format_paint_with_alternatives(paint, alt_dict)
@@ -407,7 +443,7 @@ def print_results(target_hex, result_dict, alt_dict):
         print("Не найдено подходящих смесей.")
         return
     n = 2 if result_dict['type'] == 'mix2' else 3
-    print(f"\n🎨 Лучшие смеси из {n} красок:")
+    print(f"\n Лучшие смеси из {n} красок:")
     for i, mix in enumerate(top):
         delta = mix['delta_e']
         real_perc = delta_to_percent(delta)
@@ -416,24 +452,38 @@ def print_results(target_hex, result_dict, alt_dict):
         print(f"\n--- Вариант {i+1} (совпадение ~{real_perc:.1f}%, Delta E={delta:.2f}) ---")
         print(f"Пропорции (части): {parts}")
         print(f"Пропорции (%): {perc_str}")
+        print("Исходные краски:")
         for j, p in enumerate(mix['paints']):
-            print(f"  {j+1}. {format_paint_with_alternatives(p, alt_dict)}")
+            hex_code = p['hex']
+            block = color_block(hex_code)
+            desc = f"{p['brand']} / {p['name']} (арт.{p['article']}) — #{hex_code}"
+            alt = format_alternatives(hex_code, alt_dict)
+            print(f"  {j+1}. {block} {desc}{alt}")
+        # Вычисляем результирующий цвет
+        L_mix = sum(w * p['L'] for w, p in zip(mix['weights'], mix['paints']))
+        a_mix = sum(w * p['a'] for w, p in zip(mix['weights'], mix['paints']))
+        b_mix = sum(w * p['b'] for w, p in zip(mix['weights'], mix['paints']))
+        from colormath.color_objects import LabColor
+        mixed_lab_obj = LabColor(L_mix, a_mix, b_mix)
+        mixed_hex = lab_to_hex(mixed_lab_obj)
+        mixed_block = color_block(mixed_hex)
+        print(f"  Результат смешивания: {mixed_block} #{mixed_hex}")
     print("\n* 100% = Delta E=0 (идеал), 0% = Delta E≥10")
 
 # ---------- Основная функция ----------
 def interactive():
-    print("🎨 ПОДБОР СМЕСИ КРАСОК (многопроцессорный, с Numba/Cython)")
+    print(" ПОДБОР СМЕСИ КРАСОК (многопроцессорный, с Numba/Cython)")
     print("="*70)
     if USE_NUMBA:
-        print("⚡ Ускорение: Numba JIT включено")
+        print("[*] Ускорение: Numba JIT включено")
     if USE_CYTHON:
-        print("⚡ Ускорение: Cython модуль загружен")
+        print("[*] Ускорение: Cython модуль загружен")
     if not USE_NUMBA and not USE_CYTHON:
-        print("⚠️ Ускорение не активно. Установите numba или скомпилируйте Cython модуль.")
+        print("[!] Ускорение не активно. Установите numba или скомпилируйте Cython модуль.")
     paints = load_paints()
     alt_dict = build_hex_alternatives(paints)
     if alt_dict:
-        print(f"📌 Обнаружены дубликаты по HEX: {len(alt_dict)} цветов имеют альтернативы.")
+        print(f"[i] Обнаружены дубликаты по HEX: {len(alt_dict)} цветов имеют альтернативы.")
     target = input("\nЦелевой HEX (например FFD700): ").strip().lstrip('#')
     if len(target)!=6 or not all(c in '0123456789ABCDEFabcdef' for c in target):
         print("Неверный HEX.")
