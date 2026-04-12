@@ -1,35 +1,70 @@
-import pandas as pd
-import numpy as np
-import sqlite3
-from colormath.color_objects import sRGBColor, LabColor
-from colormath.color_conversions import convert_color
-from math import gcd
-from itertools import combinations
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import sys
 import os
+import sqlite3
+import numpy as np
+import pandas as pd
+from math import gcd
+from fractions import Fraction
+from itertools import combinations
 from tqdm import tqdm
 import multiprocessing as mp
-from functools import partial
-import heapq
 import traceback
+import mixbox
 
-# ------------ Цветные блоки ----------
-def color_block(hex_code, size=2):
-    """Возвращает строку с цветным квадратиком размера size x size символов"""
-    hex_code = hex_code.lstrip('#')
-    if len(hex_code) != 6:
-        return "[?]"
-    r = int(hex_code[0:2], 16)
-    g = int(hex_code[2:4], 16)
-    b = int(hex_code[4:6], 16)
-    # ANSI escape-код для фона
-    block = f"\x1b[48;2;{r};{g};{b}m{' ' * (size*2)}\x1b[0m"
-    return block
+# ---------- Отключаем излишнее логирование (ускорение) ----------
+import logging
+logging.disable(logging.CRITICAL)
 
-# ---------- Импорты для ускорения ----------
+# ---------- Быстрые преобразования RGB <-> LAB (без colormath) ----------
+SRGB_TO_XYZ_MATRIX = np.array([
+    [0.4124564, 0.3575761, 0.1804375],
+    [0.2126729, 0.7151522, 0.0721750],
+    [0.0193339, 0.1191920, 0.9503041]
+])
+XYZ_WHITE = np.array([0.95047, 1.00000, 0.95047])
+
+def rgb_to_lab_fast(rgb):
+    r, g, b = [x / 255.0 for x in rgb]
+    # sRGB -> линейное RGB
+    r = r**2.4 if r > 0.04045 else r / 12.92
+    g = g**2.4 if g > 0.04045 else g / 12.92
+    b = b**2.4 if b > 0.04045 else b / 12.92
+    # линейное RGB -> XYZ
+    xyz = np.dot(SRGB_TO_XYZ_MATRIX, [r, g, b])
+    xyz_n = xyz / XYZ_WHITE
+    def f(t):
+        return t**(1/3) if t > 0.008856 else (7.787 * t + 16/116)
+    L = 116.0 * f(xyz_n[1]) - 16.0
+    a = 500.0 * (f(xyz_n[0]) - f(xyz_n[1]))
+    b_ = 200.0 * (f(xyz_n[1]) - f(xyz_n[2]))
+    return (L, a, b_)
+
+def lab_to_rgb_fast(lab):
+    L, a, b = lab
+    fy = (L + 16.0) / 116.0
+    fx = fy + a / 500.0
+    fz = fy - b / 200.0
+    def f_inv(t):
+        t3 = t**3
+        return t3 if t3 > 0.008856 else (t - 16/116) / 7.787
+    x = f_inv(fx) * XYZ_WHITE[0]
+    y = f_inv(fy) * XYZ_WHITE[1]
+    z = f_inv(fz) * XYZ_WHITE[2]
+    inv_matrix = np.linalg.inv(SRGB_TO_XYZ_MATRIX)
+    rgb_lin = np.dot(inv_matrix, [x, y, z])
+    def gamma(c):
+        c = max(0.0, min(1.0, c))
+        return 12.92 * c if c <= 0.0031308 else 1.055 * (c**(1/2.4)) - 0.055
+    r = gamma(rgb_lin[0])
+    g = gamma(rgb_lin[1])
+    b_ = gamma(rgb_lin[2])
+    return (int(round(r * 255)), int(round(g * 255)), int(round(b_ * 255)))
+
+# ---------- Delta E 2000 (Numba, если доступна) ----------
 USE_NUMBA = False
-USE_CYTHON = False
-
 try:
     from numba import jit
     USE_NUMBA = True
@@ -38,15 +73,7 @@ except ImportError:
         if args and callable(args[0]):
             return args[0]
         return lambda f: f
-    USE_NUMBA = False
 
-try:
-    from deltae_cython import delta_e_cie2000 as cython_delta_e
-    USE_CYTHON = True
-except ImportError:
-    cython_delta_e = None
-
-# ---------- Delta E 2000 (Numba) ----------
 @jit(nopython=True)
 def delta_e_cie2000_fast(L1, a1, b1, L2, a2, b2):
     kL, kC, kH = 1.0, 1.0, 1.0
@@ -91,21 +118,9 @@ def delta_e_cie2000_fast(L1, a1, b1, L2, a2, b2):
     )
     return delta_E
 
-def delta_e_cie2000_dispatch(lab1, lab2):
-    if USE_CYTHON and cython_delta_e is not None:
-        return cython_delta_e(lab1.lab_l, lab1.lab_a, lab1.lab_b,
-                              lab2.lab_l, lab2.lab_a, lab2.lab_b)
-    elif USE_NUMBA:
-        return delta_e_cie2000_fast(lab1.lab_l, lab1.lab_a, lab1.lab_b,
-                                    lab2.lab_l, lab2.lab_a, lab2.lab_b)
-    else:
-        from colormath.color_diff import delta_e_cie2000 as orig
-        return orig(lab1, lab2)
-
 # ---------- Загрузка базы ----------
 DB_FILENAME = "paints.db"
 EPSILON = 0.5
-
 
 def load_paints():
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -114,77 +129,18 @@ def load_paints():
         print(f"[X] Файл базы данных {DB_FILENAME} не найден в папке:\n   {script_dir}")
         print("Убедитесь, что вы сконвертировали CSV в SQLite с помощью convert_csv_to_sqlite.py")
         sys.exit(1)
-    
     conn = sqlite3.connect(db_path)
-    # Читаем все нужные колонки
     df = pd.read_sql_query("SELECT article, name, hex, brand FROM paints", conn)
     conn.close()
-    
-    # Небольшая пост-обработка, как и раньше
     df['hex'] = df['hex'].astype(str).str.replace('#', '').str.upper()
     df = df.dropna(subset=['hex'])
-    
     print(f"[OK] Загружено красок из SQLite: {len(df)}")
     return df
 
-#def detect_encoding(file_path):
-#    encodings = ['utf-8-sig', 'utf-8', 'cp1251', 'windows-1251', 'koi8-r', 'latin1']
-#    for enc in encodings:
-#       try:
-#           with open(file_path, 'r', encoding=enc) as f:
-#                f.readline()
-#            return enc
-#        except UnicodeDecodeError:
-#            continue
-#    return 'latin1'
-
-#def detect_delimiter(file_path, encoding):
-#    with open(file_path, 'r', encoding=encoding) as f:
-#        first = f.readline()
-#        return ';' if ';' in first and ',' not in first else ','
-
-#def load_paints():
-#    script_dir = os.path.dirname(os.path.abspath(__file__))
-#    file_path = os.path.join(script_dir, CSV_FILENAME)
-#    if not os.path.exists(file_path):
-#        print(f"[X] Файл {CSV_FILENAME} не найден в папке:\n   {script_dir}")
-#        sys.exit(1)
-#    encoding = detect_encoding(file_path)
-#    delim = detect_delimiter(file_path, encoding)
-#    df = pd.read_csv(file_path, delimiter=delim, encoding=encoding)
-#    df.columns = df.columns.str.strip().str.lower()
-#    required = ['article', 'name', 'hex', 'brand']
-#    missing = [c for c in required if c not in df.columns]
-#    if missing:
-#        other = ';' if delim == ',' else ','
-#        df = pd.read_csv(file_path, delimiter=other, encoding=encoding)
-#        df.columns = df.columns.str.strip().str.lower()
-#        missing = [c for c in required if c not in df.columns]
-#        if missing:
-#            print(f"[X] Ошибка: в CSV нет колонок {required}\n   Найдено: {list(df.columns)}")
-#            sys.exit(1)
-#    df['hex'] = df['hex'].astype(str).str.replace('#', '').str.upper()
-#    df = df.dropna(subset=['hex'])
-#    print(f"[OK] Загружено красок: {len(df)}")
-#    return df
-
-def hex_to_lab(hex_color):
-    hex_color = hex_color.lstrip('#')
-    r = int(hex_color[0:2], 16) / 255.0
-    g = int(hex_color[2:4], 16) / 255.0
-    b = int(hex_color[4:6], 16) / 255.0
-    return convert_color(sRGBColor(r, g, b), LabColor)
-
-def lab_to_hex(lab):
-    rgb = convert_color(lab, sRGBColor)
-    r = max(0, min(1, rgb.rgb_r))
-    g = max(0, min(1, rgb.rgb_g))
-    b = max(0, min(1, rgb.rgb_b))
-    return f"{int(r*255):02X}{int(g*255):02X}{int(b*255):02X}"
-
-def generate_weights_for_2():
+# ---------- Генерация весов ----------
+def generate_weights_for_2(max_denom=6):
     weights_set = set()
-    for denom in range(2, 9):
+    for denom in range(2, max_denom + 1):
         for a in range(1, denom):
             b = denom - a
             w1 = a / denom
@@ -195,168 +151,136 @@ def generate_weights_for_2():
 def generate_weights_for_3():
     return [(1/3, 1/3, 1/3)]
 
-def mix_colors(lab_list, weights):
-    L = sum(w * c.lab_l for w, c in zip(weights, lab_list))
-    a = sum(w * c.lab_a for w, c in zip(weights, lab_list))
-    b = sum(w * c.lab_b for w, c in zip(weights, lab_list))
-    return LabColor(L, a, b)
-
-# ---------- Оптимизированные функции для multiprocessing ----------
+# ---------- Предвычисление данных красок ----------
 def precompute_paints_data(paints_df):
     paints_data = []
     for idx, row in paints_df.iterrows():
-        lab = hex_to_lab(row['hex'])
+        hex_color = row['hex']
+        rgb = (int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16))
+        lab = rgb_to_lab_fast(rgb)
+        latent = mixbox.rgb_to_latent(rgb)
         paints_data.append({
             'idx': idx,
-            'L': lab.lab_l,
-            'a': lab.lab_a,
-            'b': lab.lab_b,
+            'L': lab[0],
+            'a': lab[1],
+            'b': lab[2],
+            'rgb': rgb,
             'brand': row['brand'],
             'name': row['name'],
             'article': row['article'],
-            'hex': row['hex']
+            'hex': hex_color,
+            'latent': latent
         })
     return paints_data
 
+# ---------- Обработка пары (оптимизировано) ----------
 def process_pair(args, target_L, target_a, target_b, paints_data, weights_list):
     idx1, idx2 = args
     p1 = paints_data[idx1]
     p2 = paints_data[idx2]
-    lab1 = (p1['L'], p1['a'], p1['b'])
-    lab2 = (p2['L'], p2['a'], p2['b'])
+    z1 = p1['latent']
+    z2 = p2['latent']
     results = []
     for w1, w2 in weights_list:
-        L_mix = w1 * lab1[0] + w2 * lab2[0]
-        a_mix = w1 * lab1[1] + w2 * lab2[1]
-        b_mix = w1 * lab1[2] + w2 * lab2[2]
-        mixed_lab = LabColor(L_mix, a_mix, b_mix)
-        target_lab = LabColor(target_L, target_a, target_b)
-        delta = delta_e_cie2000_dispatch(target_lab, mixed_lab)
+        z_mix = [0.0] * mixbox.LATENT_SIZE
+        for i in range(mixbox.LATENT_SIZE):
+            z_mix[i] = w1 * z1[i] + w2 * z2[i]
+        rgb_mix = mixbox.latent_to_rgb(z_mix)
+        L_mix, a_mix, b_mix = rgb_to_lab_fast(rgb_mix)
+        delta = delta_e_cie2000_fast(target_L, target_a, target_b, L_mix, a_mix, b_mix)
         results.append({
             'delta_e': delta,
             'paints': [p1, p2],
             'weights': (w1, w2),
-            'mixed_lab': mixed_lab
+            'mixed_lab': (L_mix, a_mix, b_mix)
         })
     return results
 
+# ---------- Обработка тройки ----------
 def process_triplet(args, target_L, target_a, target_b, paints_data, weights):
     idx1, idx2, idx3 = args
     p1 = paints_data[idx1]
     p2 = paints_data[idx2]
     p3 = paints_data[idx3]
-    lab1 = (p1['L'], p1['a'], p1['b'])
-    lab2 = (p2['L'], p2['a'], p2['b'])
-    lab3 = (p3['L'], p3['a'], p3['b'])
-    L_mix = weights[0]*lab1[0] + weights[1]*lab2[0] + weights[2]*lab3[0]
-    a_mix = weights[0]*lab1[1] + weights[1]*lab2[1] + weights[2]*lab3[1]
-    b_mix = weights[0]*lab1[2] + weights[1]*lab2[2] + weights[2]*lab3[2]
-    mixed_lab = LabColor(L_mix, a_mix, b_mix)
-    target_lab = LabColor(target_L, target_a, target_b)
-    delta = delta_e_cie2000_dispatch(target_lab, mixed_lab)
+    z1 = p1['latent']
+    z2 = p2['latent']
+    z3 = p3['latent']
+    z_mix = [0.0] * mixbox.LATENT_SIZE
+    w1, w2, w3 = weights
+    for i in range(mixbox.LATENT_SIZE):
+        z_mix[i] = w1 * z1[i] + w2 * z2[i] + w3 * z3[i]
+    rgb_mix = mixbox.latent_to_rgb(z_mix)
+    L_mix, a_mix, b_mix = rgb_to_lab_fast(rgb_mix)
+    delta = delta_e_cie2000_fast(target_L, target_a, target_b, L_mix, a_mix, b_mix)
     return {
         'delta_e': delta,
         'paints': [p1, p2, p3],
         'weights': weights,
-        'mixed_lab': mixed_lab
+        'mixed_lab': (L_mix, a_mix, b_mix)
     }
 
-def find_best_mix_2(target_lab, paints_df):
-    target_L = target_lab.lab_l
-    target_a = target_lab.lab_a
-    target_b = target_lab.lab_b
+# ---------- Предотбор красок ----------
+def select_top_paints(target_lab, paints_data, top_k=200):
+    L, a, b = target_lab
+    distances = []
+    for i, p in enumerate(paints_data):
+        d = (p['L'] - L)**2 + (p['a'] - a)**2 + (p['b'] - b)**2
+        distances.append((d, i))
+    distances.sort(key=lambda x: x[0])
+    return [idx for _, idx in distances[:top_k]]
 
-    weights_list = generate_weights_for_2()
-    paints_data = precompute_paints_data(paints_df)
+# ---------- Поиск лучших смесей ----------
+def find_best_mix_2(target_lab, paints_df, top_k=200):
+    target_L, target_a, target_b = target_lab
+    weights_list = generate_weights_for_2(max_denom=6)
+    full_paints = precompute_paints_data(paints_df)
+    selected_indices = select_top_paints((target_L, target_a, target_b), full_paints, top_k)
+    paints_data = [full_paints[i] for i in selected_indices]
     n = len(paints_data)
-    total_pairs = n * (n - 1) // 2   # число сочетаний для tqdm
-
-    print(f"[CPU️] Перебор 2 красок (однопоточный, всего {total_pairs} пар)")
-    top_results = []   # храним топ-3 (delta_e, результат)
-
-    from itertools import combinations
+    total_pairs = n * (n - 1) // 2
+    print(f"[CPU] Перебор 2 красок (предотбор {top_k} из {len(full_paints)}, всего {total_pairs} пар) с Mixbox")
+    top_results = []
     for idx1, idx2 in tqdm(combinations(range(n), 2), total=total_pairs, desc="Перебор пар"):
-        p1 = paints_data[idx1]
-        p2 = paints_data[idx2]
-        L1, a1, b1 = p1['L'], p1['a'], p1['b']
-        L2, a2, b2 = p2['L'], p2['a'], p2['b']
-
-        for w1, w2 in weights_list:
-            L_mix = w1 * L1 + w2 * L2
-            a_mix = w1 * a1 + w2 * a2
-            b_mix = w1 * b1 + w2 * b2
-
-            delta = delta_e_cie2000_fast(target_L, target_a, target_b, L_mix, a_mix, b_mix)
-
-            res = {
-                'delta_e': delta,
-                'paints': [p1, p2],
-                'weights': (w1, w2),
-                'mixed_lab': None   # не используем, можно удалить
-            }
-
-            # Вставка в топ-3 (простая, без heapq)
+        results = process_pair((idx1, idx2), target_L, target_a, target_b, paints_data, weights_list)
+        for res in results:
             if len(top_results) < 3:
                 top_results.append(res)
                 top_results.sort(key=lambda x: x['delta_e'])
             else:
-                if delta < top_results[-1]['delta_e']:
+                if res['delta_e'] < top_results[-1]['delta_e']:
                     top_results[-1] = res
                     top_results.sort(key=lambda x: x['delta_e'])
-
     return top_results
 
-def find_best_mix_3(target_lab, paints_df):
-    target_L = target_lab.lab_l
-    target_a = target_lab.lab_a
-    target_b = target_lab.lab_b
-
+def find_best_mix_3(target_lab, paints_df, top_k=100):
+    target_L, target_a, target_b = target_lab
     weights = (1/3, 1/3, 1/3)
-    paints_data = precompute_paints_data(paints_df)
+    full_paints = precompute_paints_data(paints_df)
+    selected_indices = select_top_paints((target_L, target_a, target_b), full_paints, top_k)
+    paints_data = [full_paints[i] for i in selected_indices]
     n = len(paints_data)
     total_triplets = n * (n - 1) * (n - 2) // 6
-
-    print(f"🖥[CPU] Перебор 3 красок (однопоточный, всего {total_triplets} троек)")
+    print(f"[CPU] Перебор 3 красок (предотбор {top_k} из {len(full_paints)}, всего {total_triplets} троек) с Mixbox")
     top_results = []
-
-    from itertools import combinations
     for idx1, idx2, idx3 in tqdm(combinations(range(n), 3), total=total_triplets, desc="Перебор троек"):
-        p1 = paints_data[idx1]
-        p2 = paints_data[idx2]
-        p3 = paints_data[idx3]
-        L1, a1, b1 = p1['L'], p1['a'], p1['b']
-        L2, a2, b2 = p2['L'], p2['a'], p2['b']
-        L3, a3, b3 = p3['L'], p3['a'], p3['b']
-
-        L_mix = weights[0]*L1 + weights[1]*L2 + weights[2]*L3
-        a_mix = weights[0]*a1 + weights[1]*a2 + weights[2]*a3
-        b_mix = weights[0]*b1 + weights[1]*b2 + weights[2]*b3
-
-        delta = delta_e_cie2000_fast(target_L, target_a, target_b, L_mix, a_mix, b_mix)
-
-        res = {
-            'delta_e': delta,
-            'paints': [p1, p2, p3],
-            'weights': weights,
-            'mixed_lab': None
-        }
-
+        res = process_triplet((idx1, idx2, idx3), target_L, target_a, target_b, paints_data, weights)
         if len(top_results) < 3:
             top_results.append(res)
             top_results.sort(key=lambda x: x['delta_e'])
         else:
-            if delta < top_results[-1]['delta_e']:
+            if res['delta_e'] < top_results[-1]['delta_e']:
                 top_results[-1] = res
                 top_results.sort(key=lambda x: x['delta_e'])
-
     return top_results
 
-# ---------- Остальные функции ----------
+# ---------- Точные совпадения ----------
 def find_exact_matches(target_lab, paints_df):
     matches = []
-    for idx, row in paints_df.iterrows():
-        lab = hex_to_lab(row['hex'])
-        delta = delta_e_cie2000_dispatch(target_lab, lab)
+    target_L, target_a, target_b = target_lab
+    for _, row in paints_df.iterrows():
+        rgb = (int(row['hex'][0:2], 16), int(row['hex'][2:4], 16), int(row['hex'][4:6], 16))
+        L, a, b = rgb_to_lab_fast(rgb)
+        delta = delta_e_cie2000_fast(target_L, target_a, target_b, L, a, b)
         if delta <= EPSILON:
             matches.append({'paint': row, 'delta_e': delta})
     return matches
@@ -364,62 +288,35 @@ def find_exact_matches(target_lab, paints_df):
 def delta_to_percent(delta):
     return max(0.0, min(100.0, 100.0 - delta * 10.0))
 
-def auto_find_mixes(target_lab, paints_df):
-    exact = find_exact_matches(target_lab, paints_df)
-    if exact:
-        print(f"\n[OK] Найдено точных совпадений: {len(exact)}")
-        return {'type': 'exact', 'result': exact}
-    print("\n Точной краски нет. Пробуем смешать 2 краски...")
-    best_2 = find_best_mix_2(target_lab, paints_df)
-    if best_2:
-        best_delta_2 = best_2[0]['delta_e']
-        print(f"Лучшая смесь из 2 красок даёт Delta E={best_delta_2:.2f}")
-        if best_delta_2 <= 2.0:
-            return {'type': 'mix2', 'result': best_2}
-        else:
-            print("Точность невысока, пробуем 3 краски...")
-    else:
-        print("Не найдено смесей из 2 красок, пробуем 3 краски...")
-    best_3 = find_best_mix_3(target_lab, paints_df)
-    if best_3:
-        return {'type': 'mix3', 'result': best_3}
-    else:
-        return {'type': 'none', 'result': None}
-
-def weights_to_parts(weights):
-    from fractions import Fraction
-    fracs = [Fraction(w).limit_denominator(8) for w in weights]
-    denoms = [f.denominator for f in fracs]
-    common_denom = 1
-    for d in denoms:
-        common_denom = common_denom * d // gcd(common_denom, d)
-    parts = [f.numerator * (common_denom // f.denominator) for f in fracs]
-    g = parts[0]
-    for p in parts[1:]:
-        g = gcd(g, p)
-    parts = [p // g for p in parts]
-    return ':'.join(str(p) for p in parts)
-
+# ---------- Формирование альтернатив (без дублирования) ----------
 def build_hex_alternatives(df):
     alt = {}
     for _, row in df.iterrows():
         h = row['hex']
-        alt.setdefault(h, []).append({'article': row['article'], 'brand': row['brand']})
-    return {h: lst for h, lst in alt.items() if len(lst) > 1}
+        pair = (row['article'], row['brand'])
+        if h not in alt:
+            alt[h] = set()
+        alt[h].add(pair)
+    return {h: [{'article': art, 'brand': br} for art, br in pairs] for h, pairs in alt.items() if len(pairs) > 1}
 
-def format_alternatives(hex_code, alt_dict):
+def format_alternatives(hex_code, alt_dict, current_article=None, current_brand=None):
     if hex_code in alt_dict:
         alts = alt_dict[hex_code]
-        parts = [f"арт.{a['article']}, {a['brand']}" for a in alts]
-        return " (" + "; ".join(parts) + ")"
+        filtered = [a for a in alts if (a['article'], a['brand']) != (current_article, current_brand)]
+        if not filtered:
+            return ""
+        parts = [f"арт.{a['article']}, {a['brand']}" for a in filtered]
+        return " (альт.: " + "; ".join(parts) + ")"
     return ""
 
 def format_paint_with_alternatives(paint_row, alt_dict):
     hex_code = paint_row['hex']
-    block = color_block(hex_code, size=2)
-    base = f"{block} {paint_row['brand']} / {paint_row['name']} (арт.{paint_row['article']}) — #{hex_code}"
-    return base + format_alternatives(hex_code, alt_dict)
+    block = f"[{hex_code}]"
+    base = f"{block} {paint_row['brand']} / {paint_row['name']} (арт.{paint_row['article']})"
+    alt = format_alternatives(hex_code, alt_dict, paint_row['article'], paint_row['brand'])
+    return base + alt
 
+# ---------- Вывод результатов ----------
 def print_results(target_hex, result_dict, alt_dict):
     print("\n" + "="*70)
     print(f"Целевой цвет: #{target_hex.upper()}")
@@ -445,53 +342,98 @@ def print_results(target_hex, result_dict, alt_dict):
     n = 2 if result_dict['type'] == 'mix2' else 3
     print(f"\n Лучшие смеси из {n} красок:")
     for i, mix in enumerate(top):
-        delta = mix['delta_e']
-        real_perc = delta_to_percent(delta)
-        parts = weights_to_parts(mix['weights'])
-        perc_str = ' + '.join(f"{p*100:.1f}%" for p in mix['weights'])
-        print(f"\n--- Вариант {i+1} (совпадение ~{real_perc:.1f}%, Delta E={delta:.2f}) ---")
-        print(f"Пропорции (части): {parts}")
-        print(f"Пропорции (%): {perc_str}")
+        real_perc = delta_to_percent(mix['delta_e'])
+        print(f"\nВариант {i+1}: совпадение ~{real_perc:.1f}%")
+        # Вычисляем части для каждой краски
+        weights = mix['weights']
+        fracs = [Fraction(w).limit_denominator(8) for w in weights]
+        denoms = [f.denominator for f in fracs]
+        common_denom = 1
+        for d in denoms:
+            common_denom = common_denom * d // gcd(common_denom, d)
+        parts_list = [f.numerator * (common_denom // f.denominator) for f in fracs]
+        g = parts_list[0]
+        for p in parts_list[1:]:
+            g = gcd(g, p)
+        parts_list = [p // g for p in parts_list]
         print("Исходные краски:")
         for j, p in enumerate(mix['paints']):
+            part = parts_list[j]
+            percent = weights[j] * 100
+            # Склонение
+            if part % 10 == 1 and part % 100 != 11:
+                part_word = f"{part} часть"
+            elif 2 <= part % 10 <= 4 and (part % 100 < 10 or part % 100 >= 20):
+                part_word = f"{part} части"
+            else:
+                part_word = f"{part} частей"
             hex_code = p['hex']
-            block = color_block(hex_code)
-            desc = f"{p['brand']} / {p['name']} (арт.{p['article']}) — #{hex_code}"
-            alt = format_alternatives(hex_code, alt_dict)
-            print(f"  {j+1}. {block} {desc}{alt}")
-        # Вычисляем результирующий цвет
-        L_mix = sum(w * p['L'] for w, p in zip(mix['weights'], mix['paints']))
-        a_mix = sum(w * p['a'] for w, p in zip(mix['weights'], mix['paints']))
-        b_mix = sum(w * p['b'] for w, p in zip(mix['weights'], mix['paints']))
-        from colormath.color_objects import LabColor
-        mixed_lab_obj = LabColor(L_mix, a_mix, b_mix)
-        mixed_hex = lab_to_hex(mixed_lab_obj)
-        mixed_block = color_block(mixed_hex)
-        print(f"  Результат смешивания: {mixed_block} #{mixed_hex}")
-    print("\n* 100% = Delta E=0 (идеал), 0% = Delta E≥10")
+            block = f"[{hex_code}]"
+            desc = f"{p['brand']} / {p['name']} (арт.{p['article']})"
+            print(f"{part_word} ({percent:.1f}%) - {block} {desc}")
+        # Результирующий цвет
+        mixed_lab = mix['mixed_lab']
+        mixed_rgb = lab_to_rgb_fast(mixed_lab)
+        mixed_hex = f"{mixed_rgb[0]:02X}{mixed_rgb[1]:02X}{mixed_rgb[2]:02X}"
+        mixed_block = f"[{mixed_hex}]"
+        print(f"  Результат смешивания: {mixed_block}")
+#    print("\n* 100% = Delta E=0 (идеал), 0% = Delta E≥10")
 
-# ---------- Основная функция ----------
+# ---------- Основной цикл с интерактивным предложением ----------
 def interactive():
-    print(" ПОДБОР СМЕСИ КРАСОК (многопроцессорный, с Numba/Cython)")
+    print(" ПОДБОР СМЕСИ КРАСОК")
     print("="*70)
     if USE_NUMBA:
         print("[*] Ускорение: Numba JIT включено")
-    if USE_CYTHON:
-        print("[*] Ускорение: Cython модуль загружен")
-    if not USE_NUMBA and not USE_CYTHON:
-        print("[!] Ускорение не активно. Установите numba или скомпилируйте Cython модуль.")
+    else:
+        print("[!] Numba не установлена, установите для ускорения: pip install numba")
+
     paints = load_paints()
     alt_dict = build_hex_alternatives(paints)
     if alt_dict:
         print(f"[i] Обнаружены дубликаты по HEX: {len(alt_dict)} цветов имеют альтернативы.")
-    target = input("\nЦелевой HEX (например FFD700): ").strip().lstrip('#')
-    if len(target)!=6 or not all(c in '0123456789ABCDEFabcdef' for c in target):
-        print("Неверный HEX.")
-        sys.exit(1)
-    target = target.upper()
-    target_lab = hex_to_lab(target)
-    result = auto_find_mixes(target_lab, paints)
-    print_results(target, result, alt_dict)
+
+    while True:
+        target = input("\nЦелевой HEX (например FFD700) или Enter/q для выхода: ").strip().lstrip('#')
+        if target.lower() in ('', 'q', 'exit', 'quit'):
+            print("Выход.")
+            break
+        if len(target) != 6 or not all(c in '0123456789ABCDEFabcdef' for c in target):
+            print("Неверный HEX. Нужно 6 символов (0-9, A-F).")
+            continue
+        target = target.upper()
+        target_rgb = (int(target[0:2], 16), int(target[2:4], 16), int(target[4:6], 16))
+        target_lab = rgb_to_lab_fast(target_rgb)
+
+        # 1. Точные совпадения
+        exact = find_exact_matches(target_lab, paints)
+        if exact:
+            print_results(target, {'type': 'exact', 'result': exact}, alt_dict)
+            continue
+
+        # 2. Поиск смесей из 2 красок
+        best_2 = find_best_mix_2(target_lab, paints, top_k=200)
+        if best_2:
+            best_percent = delta_to_percent(best_2[0]['delta_e'])
+            print_results(target, {'type': 'mix2', 'result': best_2}, alt_dict)
+
+            # Если лучший вариант < 95% – предложить проверить 3 краски
+            if best_percent < 95.0:
+                answer = input("\nСовпадение менее 95%. Хотите проверить смеси из 3 красок? (y/n): ").strip().lower()
+                if answer == 'y':
+                    best_3 = find_best_mix_3(target_lab, paints, top_k=100)
+                    if best_3:
+                        print_results(target, {'type': 'mix3', 'result': best_3}, alt_dict)
+                    else:
+                        print("Не найдено подходящих смесей из 3 красок.")
+        else:
+            # Если нет ни одной пары – сразу пробуем тройки
+            print("Не найдено подходящих смесей из 2 красок. Пробуем 3...")
+            best_3 = find_best_mix_3(target_lab, paints, top_k=100)
+            if best_3:
+                print_results(target, {'type': 'mix3', 'result': best_3}, alt_dict)
+            else:
+                print("Не найдено подходящих смесей.")
 
 if __name__ == '__main__':
     mp.freeze_support()
